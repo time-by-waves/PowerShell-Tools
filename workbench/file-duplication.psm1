@@ -1,57 +1,10 @@
 #Requires -Version 7.0
-<#
-.SYNOPSIS
-    Finds duplicate files across one or more paths and optionally stages them for review.
-.DESCRIPTION
-    Uses a three-phase pipeline (size grouping → partial hash → full hash) to efficiently
-    locate duplicate files across drives or folders of any size. Results are persisted to
-    a JSON report and companion CSV so the output can be reviewed or acted on without
-    re-scanning. No files are deleted; duplicates are only moved to a staging area with
-    their original path structure preserved for manual inspection.
-.PARAMETER Path
-    One or more root paths to scan. Accepts drive roots, folders, or UNC paths.
-.PARAMETER StagingRoot
-    Destination root for staged duplicates. Required when -Stage is used.
-    Original directory structure is preserved beneath this root.
-.PARAMETER ReportPath
-    Path for the JSON report. Defaults to .\duplicate-report.json.
-    A companion CSV is written at the same location with a .csv extension.
-.PARAMETER FromReport
-    Load a previously saved report instead of performing a new scan.
-.PARAMETER Stage
-    Move the lower-priority file from each pending pair to the staging area.
-    Requires -StagingRoot. Supports -WhatIf.
-.PARAMETER ExcludeFolder
-    Folder names to skip during traversal (matched on folder name, not full path).
-.PARAMETER Algorithm
-    Hash algorithm used for full verification: SHA256 (default), MD5, or SHA1.
-.EXAMPLE
-    # Full scan across two drives, stage duplicates
-    .\file-duplication.ps1 -Path 'C:\', 'D:\' -StagingRoot 'E:\Staging' -Stage
-
-    # Preview staging without moving anything
-    .\file-duplication.ps1 -Path 'C:\', 'D:\' -StagingRoot 'E:\Staging' -Stage -WhatIf
-
-    # Reload a previous report and display it without re-scanning
-    .\file-duplication.ps1 -FromReport -ReportPath '.\duplicate-report.json'
-#>
-[CmdletBinding(SupportsShouldProcess)]
-param(
-    [string[]] $Path          = @('C:\Downloads', 'C:\Temp'),
-    [string]   $StagingRoot,
-    [string]   $ReportPath    = '.\duplicate-report.json',
-    [switch]   $FromReport,
-    [switch]   $Stage,
-    [string[]] $ExcludeFolder = @('.git', 'node_modules', '.vs'),
-    [ValidateSet('SHA256', 'MD5', 'SHA1')]
-    [string]   $Algorithm     = 'SHA256'
-)
 
 Set-StrictMode -Version Latest
 
 #region ── Private helpers ────────────────────────────────────────────────────
 
-function script:Get-StagedPath {
+function Get-StagedPath {
     param([string]$OriginalPath, [string]$StagingRoot)
     # C:\Foo\file.txt  → <staging>\C\Foo\file.txt
     # \\server\share\f → <staging>\UNC\server\share\f
@@ -63,7 +16,7 @@ function script:Get-StagedPath {
     Join-Path $StagingRoot $relative
 }
 
-function script:Get-PartialFileHash {
+function Get-PartialFileHash {
     [OutputType([string])]
     param([string]$Path, [int]$ByteCount = 65536)
     try {
@@ -91,6 +44,10 @@ function Get-DuplicateCandidateFile {
         Uses a queue-based traversal to avoid following junction points or reparse
         points that would cause infinite recursion. Skips symlinks, hard links, and
         any folder name listed in ExcludeFolder.
+    .PARAMETER Path
+        One or more root paths to scan. Accepts drive roots, folders, or UNC paths.
+    .PARAMETER ExcludeFolder
+        Folder names to skip during traversal (matched on folder name, not full path).
     #>
     [CmdletBinding()]
     [OutputType([System.IO.FileInfo])]
@@ -141,6 +98,10 @@ function Confirm-FileDuplicate {
         Groups files by exact byte size, then eliminates non-matches with a 64 KB partial
         hash before computing a full hash — keeping expensive full-file reads to a minimum.
         Only confirmed matching pairs are emitted; false positives are discarded silently.
+    .PARAMETER File
+        FileInfo objects to evaluate, typically piped from Get-DuplicateCandidateFile.
+    .PARAMETER Algorithm
+        Hash algorithm used for full verification: SHA256 (default), MD5, or SHA1.
     #>
     [CmdletBinding()]
     [OutputType([PSCustomObject])]
@@ -232,6 +193,10 @@ function Move-FileToStaging {
         (C:\Foo\file.txt → <StagingRoot>\C\Foo\file.txt).
         UNC paths land under UNC\ (\\server\share\file → <StagingRoot>\UNC\server\share\file).
         Supports -WhatIf. Returns the destination path on success, or $null if skipped.
+    .PARAMETER Path
+        The source file path to move.
+    .PARAMETER StagingRoot
+        Destination root under which the original directory structure is recreated.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([string])]
@@ -265,6 +230,11 @@ function Export-DuplicateReport {
     .DESCRIPTION
         JSON is the canonical record — it preserves Status and StagedPath for re-runs.
         CSV is a flat human-readable view suitable for Excel or manual triage.
+    .PARAMETER Pair
+        Duplicate pair objects to export, typically piped from Confirm-FileDuplicate.
+    .PARAMETER Path
+        Destination path for the JSON report. A companion CSV is written at the same
+        location with a .csv extension.
     #>
     [CmdletBinding()]
     param(
@@ -291,6 +261,8 @@ function Export-DuplicateReport {
 function Import-DuplicateReport {
     <#
     .SYNOPSIS Loads a JSON report and emits the stored duplicate pairs to the pipeline.
+    .PARAMETER Path
+        Path to a JSON report previously written by Export-DuplicateReport.
     #>
     [CmdletBinding()]
     [OutputType([PSCustomObject])]
@@ -310,6 +282,13 @@ function Show-DuplicateReport {
     .DESCRIPTION
         Shows the top $TopN pairs (default 25) by file size. For the full list, open the
         companion CSV. Pairs are labelled Keep/Duplicate to reflect staging intent.
+    .PARAMETER Pair
+        Duplicate pair objects to display, typically piped from Import-DuplicateReport or
+        Confirm-FileDuplicate.
+    .PARAMETER ReportPath
+        When provided, the companion CSV path is shown in the report footer.
+    .PARAMETER TopN
+        Maximum number of pairs to display in the table. Defaults to 25.
     #>
     [CmdletBinding()]
     param(
@@ -363,6 +342,32 @@ function Invoke-DuplicateScan {
         Subsequent runs: use -FromReport to skip the scan and work from the saved report.
         Use -Stage to move the duplicate (FileB) from each pending pair to the staging area.
         The original file (FileA) is never touched. No files are deleted.
+    .PARAMETER Path
+        One or more root paths to scan. Accepts drive roots, folders, or UNC paths.
+    .PARAMETER StagingRoot
+        Destination root for staged duplicates. Required when -Stage is used.
+        Original directory structure is preserved beneath this root.
+    .PARAMETER ReportPath
+        Path for the JSON report. Defaults to .\duplicate-report.json.
+        A companion CSV is written at the same location with a .csv extension.
+    .PARAMETER FromReport
+        Load a previously saved report instead of performing a new scan.
+    .PARAMETER Stage
+        Move the lower-priority file from each pending pair to the staging area.
+        Requires -StagingRoot. Supports -WhatIf.
+    .PARAMETER ExcludeFolder
+        Folder names to skip during traversal (matched on folder name, not full path).
+    .PARAMETER Algorithm
+        Hash algorithm used for full verification: SHA256 (default), MD5, or SHA1.
+    .EXAMPLE
+        # Full scan across two drives, stage duplicates
+        Invoke-DuplicateScan -Path 'C:\', 'D:\' -StagingRoot 'E:\Staging' -Stage
+
+        # Preview staging without moving anything
+        Invoke-DuplicateScan -Path 'C:\', 'D:\' -StagingRoot 'E:\Staging' -Stage -WhatIf
+
+        # Reload a previous report and display it without re-scanning
+        Invoke-DuplicateScan -FromReport -ReportPath '.\duplicate-report.json'
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -431,15 +436,12 @@ function Invoke-DuplicateScan {
 
 #endregion
 
-# ── Entry point — skipped when dot-sourced or invoked from a Pester context ──
-$_inPester = (Get-PSCallStack).Command -contains 'Invoke-Pester'
-if ($MyInvocation.InvocationName -ne '.' -and -not $_inPester) {
-    Invoke-DuplicateScan `
-        -Path          $Path `
-        -StagingRoot   $StagingRoot `
-        -ReportPath    $ReportPath `
-        -FromReport:   $FromReport `
-        -Stage:        $Stage `
-        -ExcludeFolder $ExcludeFolder `
-        -Algorithm     $Algorithm
-}
+Export-ModuleMember -Function @(
+    'Get-DuplicateCandidateFile'
+    'Confirm-FileDuplicate'
+    'Move-FileToStaging'
+    'Export-DuplicateReport'
+    'Import-DuplicateReport'
+    'Show-DuplicateReport'
+    'Invoke-DuplicateScan'
+)
